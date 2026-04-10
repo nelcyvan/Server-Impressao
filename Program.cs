@@ -1,4 +1,8 @@
 using System.Management;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Printing;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -201,11 +205,17 @@ app.MapPost("/api/print/raw", async (HttpRequest request, PrintLogStore logStore
     await logStore.AppendAsync(entry);
     if (ok)
     {
-        logger.LogInformation("Queued RAW print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInformation("Queued RAW print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        }
     }
     else
     {
-        logger.LogWarning("RAW print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        if (logger.IsEnabled(LogLevel.Warning))
+        {
+            logger.LogWarning("RAW print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        }
     }
 
     return ok
@@ -269,11 +279,164 @@ app.MapPost("/api/print/tspl", async (HttpRequest request, PrintLogStore logStor
     await logStore.AppendAsync(entry);
     if (ok)
     {
-        logger.LogInformation("Queued TSPL print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInformation("Queued TSPL print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        }
     }
     else
     {
-        logger.LogWarning("TSPL print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        if (logger.IsEnabled(LogLevel.Warning))
+        {
+            logger.LogWarning("TSPL print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        }
+    }
+
+    return ok
+        ? Results.Ok(new { status = "queued" })
+        : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
+});
+
+app.MapPost("/api/print/image", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory, IConfiguration configuration) =>
+{
+    var logger = loggerFactory.CreateLogger("PrintServer");
+
+    var body = await request.ReadFromJsonAsync<ImagePrintRequest>();
+    if (body is null)
+    {
+        return Results.BadRequest(new { error = "invalid_body" });
+    }
+
+    if (string.IsNullOrWhiteSpace(body.PrinterName))
+    {
+        return Results.BadRequest(new { error = "printerName_required" });
+    }
+
+    if (!PrinterDiscovery.Exists(body.PrinterName))
+    {
+        return Results.NotFound(new { error = "printer_not_found" });
+    }
+
+    if (!string.Equals(body.MimeType?.Trim(), "image/png", StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.BadRequest(new { error = "mimeType_invalid" });
+    }
+
+    if (string.IsNullOrWhiteSpace(body.ImageBase64))
+    {
+        return Results.BadRequest(new { error = "imageBase64_required" });
+    }
+
+    if (body.Label is null)
+    {
+        return Results.BadRequest(new { error = "label_required" });
+    }
+
+    if (body.Label.WidthMm <= 0 || body.Label.HeightMm <= 0 || body.Label.Dpi <= 0 || body.Label.WidthPx <= 0 || body.Label.HeightPx <= 0)
+    {
+        return Results.BadRequest(new { error = "label_invalid" });
+    }
+
+    var ratioMm = body.Label.WidthMm / body.Label.HeightMm;
+    var ratioPx = (double)body.Label.WidthPx / body.Label.HeightPx;
+    var ratioDiff = Math.Abs(ratioPx - ratioMm) / ratioMm;
+    if (ratioDiff > 0.01)
+    {
+        return Results.BadRequest(new { error = "label_aspect_ratio_mismatch" });
+    }
+
+    var maxImageBytes = Math.Clamp(configuration.GetValue("PrintServer:MaxImageBytes", 8_000_000), 50_000, 50_000_000);
+    var maxBase64Chars = (int)Math.Ceiling(maxImageBytes / 3d) * 4 + 16;
+    if (body.ImageBase64.Length > maxBase64Chars)
+    {
+        return Results.BadRequest(new { error = "payload_too_large" });
+    }
+
+    byte[] pngBytes;
+    try
+    {
+        pngBytes = Convert.FromBase64String(body.ImageBase64);
+    }
+    catch
+    {
+        return Results.BadRequest(new { error = "imageBase64_invalid" });
+    }
+
+    if (pngBytes.Length > maxImageBytes)
+    {
+        return Results.BadRequest(new { error = "payload_too_large" });
+    }
+
+    if (!PngValidation.LooksLikePng(pngBytes))
+    {
+        return Results.BadRequest(new { error = "png_invalid" });
+    }
+
+    int actualWidthPx;
+    int actualHeightPx;
+    try
+    {
+        using var ms = new MemoryStream(pngBytes, writable: false);
+        using var img = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
+        if (!img.RawFormat.Equals(ImageFormat.Png))
+        {
+            return Results.BadRequest(new { error = "png_invalid" });
+        }
+
+        actualWidthPx = img.Width;
+        actualHeightPx = img.Height;
+    }
+    catch
+    {
+        return Results.BadRequest(new { error = "png_invalid" });
+    }
+
+    if (actualWidthPx != body.Label.WidthPx || actualHeightPx != body.Label.HeightPx)
+    {
+        return Results.BadRequest(new { error = "label_pixels_mismatch" });
+    }
+
+    var documentName = string.IsNullOrWhiteSpace(body.DocumentName) ? "image" : body.DocumentName.Trim();
+    bool ok;
+    try
+    {
+        ok = BitmapPrinter.PrintPngToPrinter(body.PrinterName, pngBytes, body.Label.WidthMm, body.Label.HeightMm, documentName);
+    }
+    catch (Exception ex)
+    {
+        if (logger.IsEnabled(LogLevel.Warning))
+        {
+            logger.LogWarning(ex, "Bitmap print failed: printer={PrinterName} doc={DocumentName}", body.PrinterName, documentName);
+        }
+        ok = false;
+    }
+
+    var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
+    var entry = new PrintLogEntry(
+        Id: Guid.NewGuid(),
+        Timestamp: DateTimeOffset.UtcNow,
+        Kind: "image",
+        PrinterName: body.PrinterName,
+        DocumentName: documentName,
+        BytesLength: pngBytes.Length,
+        Status: ok ? "queued" : "failed",
+        Error: ok ? null : "print_failed",
+        RemoteIp: remoteIp);
+
+    await logStore.AppendAsync(entry);
+    if (ok)
+    {
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInformation("Queued image print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        }
+    }
+    else
+    {
+        if (logger.IsEnabled(LogLevel.Warning))
+        {
+            logger.LogWarning("Image print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+        }
     }
 
     return ok
@@ -294,13 +457,18 @@ static class AppMetadata
         "/api/jobs/active",
         "/api/logs",
         "/api/print/raw",
-        "/api/print/tspl"
+        "/api/print/tspl",
+        "/api/print/image"
     ];
 }
 
 sealed record RawPrintRequest(string PrinterName, string DataBase64, string? DocumentName);
 
 sealed record TsplPrintRequest(string PrinterName, string Tspl, string? Encoding, string? DocumentName);
+
+sealed record ImagePrintRequest(string PrinterName, string MimeType, string ImageBase64, LabelSpec Label, string? DocumentName);
+
+sealed record LabelSpec(double WidthMm, double HeightMm, int Dpi, int WidthPx, int HeightPx);
 
 sealed record PrintLogEntry(
     Guid Id,
@@ -320,7 +488,7 @@ sealed class PrintLogStore
         WriteIndented = false
     };
 
-    readonly object gate = new();
+    readonly System.Threading.Lock gate = new();
     readonly List<PrintLogEntry> entries = [];
     readonly SemaphoreSlim fileGate = new(1, 1);
 
@@ -338,18 +506,16 @@ sealed class PrintLogStore
 
     public IReadOnlyList<PrintLogEntry> GetLatest(int take)
     {
-        lock (gate)
+        using (gate.EnterScope())
         {
             var start = Math.Max(entries.Count - take, 0);
-            return entries
-                .Skip(start)
-                .ToArray();
+            return [.. entries.Skip(start)];
         }
     }
 
     public async ValueTask AppendAsync(PrintLogEntry entry)
     {
-        lock (gate)
+        using (gate.EnterScope())
         {
             entries.Add(entry);
             TrimUnsafe();
@@ -361,7 +527,7 @@ sealed class PrintLogStore
 
     public async ValueTask ClearAsync()
     {
-        lock (gate)
+        using (gate.EnterScope())
         {
             entries.Clear();
         }
@@ -448,7 +614,10 @@ sealed class PrintLogStore
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Failed to load print logs from {LogPath}", filePath);
+            if (logger.IsEnabled(LogLevel.Warning))
+            {
+                logger.LogWarning(ex, "Failed to load print logs from {LogPath}", filePath);
+            }
         }
     }
 
@@ -521,7 +690,7 @@ static class UiPages
         <head>
           <meta charset="utf-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <title>PrintServer - Monitoramento</title>
+          <title>PrintServer - UI</title>
           <style>
             :root { color-scheme: light dark; }
             body { font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 16px; }
@@ -529,7 +698,7 @@ static class UiPages
             h1 { margin: 0; font-size: 18px; }
             .muted { opacity: .7; }
             .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-            input { padding: 6px 8px; min-width: 260px; }
+            input, select { padding: 6px 8px; min-width: 260px; }
             button { padding: 6px 10px; cursor: pointer; }
             table { width: 100%; border-collapse: collapse; margin-top: 12px; }
             th, td { border-bottom: 1px solid rgba(127,127,127,.35); text-align: left; padding: 8px; vertical-align: top; }
@@ -539,12 +708,16 @@ static class UiPages
             .fail { color: #c00; }
             .grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
             @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr; } }
+            textarea { width: 100%; min-height: 520px; padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.35; resize: vertical; }
+            .card { border: 1px solid rgba(127,127,127,.35); border-radius: 10px; padding: 12px; }
+            .previewWrap { overflow: auto; border: 1px solid rgba(127,127,127,.35); border-radius: 10px; padding: 12px; background: rgba(127,127,127,.08); }
+            .previewSurface { background: #fff; color: #000; display: inline-block; }
           </style>
         </head>
         <body>
           <header>
             <h1>PrintServer</h1>
-            <span class="muted">Monitoramento e logs</span>
+            <span class="muted">Monitoramento e teste de TSPL</span>
           </header>
 
           <div class="row" style="margin-top: 12px;">
@@ -559,6 +732,7 @@ static class UiPages
             <button data-tab="logs">Logs</button>
             <button data-tab="jobs">Fila</button>
             <button data-tab="printers">Impressoras</button>
+            <button data-tab="tspl">TSPL</button>
             <span class="muted" id="lastRefresh"></span>
           </div>
 
@@ -568,7 +742,12 @@ static class UiPages
             const state = {
               tab: "logs",
               apiKey: localStorage.getItem("printserver_api_key") || "",
-              intervalMs: 2000
+              intervalMs: 2000,
+              tspl: localStorage.getItem("printserver_tspl") || "",
+              tsplPrinter: localStorage.getItem("printserver_tspl_printer") || "",
+              tsplDocName: localStorage.getItem("printserver_tspl_doc") || "tspl",
+              tsplEncoding: localStorage.getItem("printserver_tspl_encoding") || "ascii",
+              tsplMounted: false
             };
 
             const elApiKey = document.getElementById("apiKey");
@@ -577,6 +756,113 @@ static class UiPages
             const elContent = document.getElementById("content");
 
             elApiKey.value = state.apiKey;
+
+            const defaultTsplSample = [
+              'SIZE 100 mm,150 mm',
+              'GAP 2 mm,0 mm',
+              'DENSITY 8',
+              'SPEED 4',
+              'DIRECTION 0',
+              'REFERENCE 0,0',
+              'CODEPAGE 1252',
+              'CLS',
+              'TEXT 16,16,"0",0,2,2,"ORANGE PEPPER"',
+              'LINE 16,80,784,80,2',
+              'BOX 16,88,256,328,2,20',
+              'QRCODE 24,96,L,5,A,0,"COD:541"',
+              'TEXT 272,88,"0",0,1,1,"GTIN:"',
+              'TEXT 272,122,"0",0,1,1,"Código: 541"',
+              'TEXT 272,156,"0",0,1,1,"Lote:"',
+              'TEXT 272,190,"0",0,1,1,"Série:"',
+              'TEXT 272,224,"0",0,1,1,"Data Pesagem:"',
+              'TEXT 272,258,"0",0,1,1,"Validade:"',
+              'TEXT 272,292,"0",0,1,1,"Tara:"',
+              'TEXT 272,326,"0",0,1,1,"Peso:"',
+              'TEXT 272,360,"0",0,1,1,"R$/kg:"',
+              'BOX 344,300,784,412,2,20',
+              'TEXT 360,308,"0",0,1,1,"TOTAL R$"',
+              'TEXT 360,340,"0",0,3,3,"0,00"',
+              'BOX 27,438,67,478,2,8',
+              'LINE 67,478,85,496,2',
+              'LINE 78,489,88,499,2',
+              'TEXT 84,442,"0",0,1,1,"ALTO"',
+              'TEXT 92,468,"0",0,1,1,"EM"',
+              'REVERSE 16,428,224,80',
+              'BOX 16,428,240,508,4,40',
+              'TEXT 322,442,"0",0,1,1,"AÇÚCAR"',
+              'TEXT 296,468,"0",0,1,1,"ADICIONADO"',
+              'REVERSE 248,428,264,80',
+              'BOX 248,428,512,508,4,40',
+              'TEXT 602,442,"0",0,1,1,"GORDURA"',
+              'TEXT 598,468,"0",0,1,1,"SATURADA"',
+              'REVERSE 520,428,264,80',
+              'BOX 520,428,784,508,4,40',
+              'TEXT 16,520,"0",0,1,1,"INFORMAÇÃO NUTRICIONAL"',
+              'TEXT 16,544,"0",0,1,1,"PORÇÃO 5g (5g)"',
+              'BOX 16,576,784,910,2,20',
+              'LINE 16,620,784,620,2',
+              'LINE 385,576,385,910,2',
+              'LINE 539,576,539,910,2',
+              'LINE 693,576,693,910,2',
+              'TEXT 393,586,"0",0,1,1,"PORCAO"',
+              'TEXT 547,586,"0",0,1,1,"EM 100g"',
+              'TEXT 701,586,"0",0,1,1,"%VD*"',
+              'LINE 16,620,784,620,1',
+              'TEXT 24,628,"0",0,1,1,"Valor Energético (kcal)"',
+              'TEXT 393,628,"0",0,1,1,"4"',
+              'TEXT 547,628,"0",0,1,1,"88,5"',
+              'TEXT 701,628,"0",0,1,1,"0"',
+              'LINE 16,649,784,649,1',
+              'TEXT 24,657,"0",0,1,1,"Carboidratos (g)"',
+              'TEXT 393,657,"0",0,1,1,"1"',
+              'TEXT 547,657,"0",0,1,1,"16"',
+              'TEXT 701,657,"0",0,1,1,"0"',
+              'LINE 16,678,784,678,1',
+              'TEXT 24,686,"0",0,1,1,"Açúcares Totais (g)"',
+              'TEXT 393,686,"0",0,1,1,"-"',
+              'TEXT 547,686,"0",0,1,1,"1,4"',
+              'TEXT 701,686,"0",0,1,1,"-"',
+              'LINE 16,707,784,707,1',
+              'TEXT 24,715,"0",0,1,1,"Açúcares Adicionados (g)"',
+              'TEXT 393,715,"0",0,1,1,"-"',
+              'TEXT 547,715,"0",0,1,1,"1,4"',
+              'TEXT 701,715,"0",0,1,1,"0"',
+              'LINE 16,736,784,736,1',
+              'TEXT 24,744,"0",0,1,1,"Proteínas (g)"',
+              'TEXT 393,744,"0",0,1,1,"-"',
+              'TEXT 547,744,"0",0,1,1,"1,4"',
+              'TEXT 701,744,"0",0,1,1,"0"',
+              'LINE 16,765,784,765,1',
+              'TEXT 24,773,"0",0,1,1,"Gorduras Totais (g)"',
+              'TEXT 393,773,"0",0,1,1,"-"',
+              'TEXT 547,773,"0",0,1,1,"2,1"',
+              'TEXT 701,773,"0",0,1,1,"0"',
+              'LINE 16,794,784,794,1',
+              'TEXT 24,802,"0",0,1,1,"Gorduras Saturadas (g)"',
+              'TEXT 393,802,"0",0,1,1,"-"',
+              'TEXT 547,802,"0",0,1,1,"0,3"',
+              'TEXT 701,802,"0",0,1,1,"0"',
+              'LINE 16,823,784,823,1',
+              'TEXT 24,831,"0",0,1,1,"Gorduras Trans (g)"',
+              'TEXT 393,831,"0",0,1,1,"-"',
+              'TEXT 547,831,"0",0,1,1,"0"',
+              'TEXT 701,831,"0",0,1,1,"**"',
+              'LINE 16,852,784,852,1',
+              'TEXT 24,860,"0",0,1,1,"Fibra Alimentar (g)"',
+              'TEXT 393,860,"0",0,1,1,"-"',
+              'TEXT 547,860,"0",0,1,1,"2,9"',
+              'TEXT 701,860,"0",0,1,1,"1"',
+              'LINE 16,881,784,881,1',
+              'TEXT 24,889,"0",0,1,1,"Sódio (mg)"',
+              'TEXT 393,889,"0",0,1,1,"697"',
+              'TEXT 547,889,"0",0,1,1,"13.939"',
+              'TEXT 701,889,"0",0,1,1,"29"',
+              'TEXT 16,918,"0",0,1,1,"*% Valores diários fornecidos pela porção."',
+              'TEXT 16,946,"0",0,1,1,"** Valor diário não estabelecido."',
+              'PRINT 1,1'
+            ].join("\n");
+
+            if (!state.tspl) state.tspl = defaultTsplSample;
 
             document.getElementById("saveKey").addEventListener("click", () => {
               state.apiKey = elApiKey.value || "";
@@ -606,6 +892,21 @@ static class UiPages
 
             async function getJson(path) {
               const res = await fetch(path, { headers: headers() });
+              if (res.status === 401) {
+                elAuthStatus.textContent = "Não autorizado (401). Configure a API Key.";
+                throw new Error("unauthorized");
+              }
+              elAuthStatus.textContent = state.apiKey ? "Autenticado" : "";
+              if (!res.ok) throw new Error(await res.text());
+              return res.json();
+            }
+
+            async function postJson(path, payload) {
+              const res = await fetch(path, {
+                method: "POST",
+                headers: { ...headers(), "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+              });
               if (res.status === 401) {
                 elAuthStatus.textContent = "Não autorizado (401). Configure a API Key.";
                 throw new Error("unauthorized");
@@ -691,6 +992,494 @@ static class UiPages
               elContent.innerHTML = renderTable("Impressoras (Win32_Printer)", head + body);
             }
 
+            function splitArgs(text) {
+              const out = [];
+              let cur = "";
+              let inQuotes = false;
+              for (let i = 0; i < text.length; i++) {
+                const ch = text[i];
+                if (ch === '"') {
+                  inQuotes = !inQuotes;
+                  cur += ch;
+                  continue;
+                }
+                if (ch === "," && !inQuotes) {
+                  out.push(cur.trim());
+                  cur = "";
+                  continue;
+                }
+                cur += ch;
+              }
+              if (cur.trim()) out.push(cur.trim());
+              return out;
+            }
+
+            function unquote(text) {
+              const t = (text ?? "").trim();
+              if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) return t.slice(1, -1);
+              return t;
+            }
+
+            function parseMmPart(text) {
+              const t = (text ?? "").trim();
+              const m = /^([0-9]+(?:\.[0-9]+)?)\s*(mm|dot|dots)?$/i.exec(t);
+              if (!m) return null;
+              return { value: Number(m[1]), unit: (m[2] || "mm").toLowerCase() };
+            }
+
+            function parseTspl(tsplText) {
+              const lines = String(tsplText || "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+              const elements = [];
+              const warnings = [];
+              let sizeMm = null;
+              let reference = { x: 0, y: 0 };
+              let maxX = 0;
+              let maxY = 0;
+
+              function updateMax(x, y) {
+                if (Number.isFinite(x)) maxX = Math.max(maxX, x);
+                if (Number.isFinite(y)) maxY = Math.max(maxY, y);
+              }
+
+              for (let i = 0; i < lines.length; i++) {
+                const raw = lines[i];
+                const line = raw.trim();
+                if (!line) continue;
+
+                const firstSpace = line.indexOf(" ");
+                const cmd = (firstSpace === -1 ? line : line.slice(0, firstSpace)).trim().toUpperCase();
+                const argsText = firstSpace === -1 ? "" : line.slice(firstSpace + 1).trim();
+
+                if (cmd === "SIZE") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 2) {
+                    const a = parseMmPart(parts[0]);
+                    const b = parseMmPart(parts[1]);
+                    if (a && b) {
+                      sizeMm = { w: a, h: b };
+                      continue;
+                    }
+                  }
+                  warnings.push(`SIZE inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "REFERENCE") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 2) {
+                    const x = Number(parts[0]);
+                    const y = Number(parts[1]);
+                    if (Number.isFinite(x) && Number.isFinite(y)) {
+                      reference = { x, y };
+                      continue;
+                    }
+                  }
+                  warnings.push(`REFERENCE inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "CLS") {
+                  elements.length = 0;
+                  continue;
+                }
+
+                if (cmd === "TEXT") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 7) {
+                    const x = Number(parts[0]) + reference.x;
+                    const y = Number(parts[1]) + reference.y;
+                    const font = unquote(parts[2]);
+                    const rotationRaw = Number(parts[3]);
+                    const xMul = Number(parts[4]);
+                    const yMul = Number(parts[5]);
+                    const text = unquote(parts.slice(6).join(","));
+                    const rotation = rotationRaw <= 3 ? rotationRaw * 90 : rotationRaw;
+                    elements.push({ kind: "text", x, y, font, rotation, xMul, yMul, text });
+                    updateMax(x, y);
+                    continue;
+                  }
+                  warnings.push(`TEXT inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "LINE") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 5) {
+                    const x1 = Number(parts[0]) + reference.x;
+                    const y1 = Number(parts[1]) + reference.y;
+                    const x2 = Number(parts[2]) + reference.x;
+                    const y2 = Number(parts[3]) + reference.y;
+                    const thickness = Math.max(1, Number(parts[4]) || 1);
+                    elements.push({ kind: "line", x1, y1, x2, y2, thickness });
+                    updateMax(x1, y1);
+                    updateMax(x2, y2);
+                    continue;
+                  }
+                  warnings.push(`LINE inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "BAR") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 4) {
+                    const x = Number(parts[0]) + reference.x;
+                    const y = Number(parts[1]) + reference.y;
+                    const w = Math.max(0, Number(parts[2]) || 0);
+                    const h = Math.max(0, Number(parts[3]) || 0);
+                    elements.push({ kind: "bar", x, y, w, h });
+                    updateMax(x, y);
+                    updateMax(x + w, y + h);
+                    continue;
+                  }
+                  warnings.push(`BAR inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "BOX") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 5) {
+                    const x1 = Number(parts[0]) + reference.x;
+                    const y1 = Number(parts[1]) + reference.y;
+                    const x2 = Number(parts[2]) + reference.x;
+                    const y2 = Number(parts[3]) + reference.y;
+                    const thickness = Math.max(1, Number(parts[4]) || 1);
+                    const radius = parts.length >= 6 ? Math.max(0, Number(parts[5]) || 0) : 0;
+                    elements.push({ kind: "box", x1, y1, x2, y2, thickness, radius });
+                    updateMax(x1, y1);
+                    updateMax(x2, y2);
+                    continue;
+                  }
+                  warnings.push(`BOX inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "REVERSE") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 4) {
+                    const x = Number(parts[0]) + reference.x;
+                    const y = Number(parts[1]) + reference.y;
+                    const w = Math.max(0, Number(parts[2]) || 0);
+                    const h = Math.max(0, Number(parts[3]) || 0);
+                    let radius = 0;
+                    for (let j = elements.length - 1; j >= 0; j--) {
+                      const el = elements[j];
+                      if (el.kind !== "box" || !el.radius) continue;
+                      const bx1 = Math.min(el.x1, el.x2);
+                      const by1 = Math.min(el.y1, el.y2);
+                      const bw = Math.abs(el.x2 - el.x1);
+                      const bh = Math.abs(el.y2 - el.y1);
+                      if (bx1 === x && by1 === y && bw === w && bh === h) {
+                        radius = el.radius;
+                        break;
+                      }
+                    }
+                    elements.push({ kind: "reverse", x, y, w, h, radius });
+                    updateMax(x, y);
+                    updateMax(x + w, y + h);
+                    continue;
+                  }
+                  warnings.push(`REVERSE inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+
+                if (cmd === "QRCODE") {
+                  const parts = splitArgs(argsText);
+                  if (parts.length >= 7) {
+                    const x = Number(parts[0]) + reference.x;
+                    const y = Number(parts[1]) + reference.y;
+                    const ecc = String(parts[2] || "").trim();
+                    const cell = Math.max(1, Number(parts[3]) || 1);
+                    const mode = String(parts[4] || "").trim();
+                    const rotationRaw = Number(parts[5]);
+                    const data = unquote(parts.slice(6).join(","));
+                    const rotation = rotationRaw <= 3 ? rotationRaw * 90 : rotationRaw;
+                    elements.push({ kind: "qrcode", x, y, ecc, cell, mode, rotation, data });
+                    updateMax(x, y);
+                    continue;
+                  }
+                  warnings.push(`QRCODE inválido na linha ${i + 1}: ${raw}`);
+                  continue;
+                }
+              }
+
+              for (const el of elements) {
+                if (el.kind !== "reverse" || el.radius) continue;
+                for (const candidate of elements) {
+                  if (candidate.kind !== "box" || !candidate.radius) continue;
+                  const bx1 = Math.min(candidate.x1, candidate.x2);
+                  const by1 = Math.min(candidate.y1, candidate.y2);
+                  const bw = Math.abs(candidate.x2 - candidate.x1);
+                  const bh = Math.abs(candidate.y2 - candidate.y1);
+                  if (bx1 === el.x && by1 === el.y && bw === el.w && bh === el.h) {
+                    el.radius = candidate.radius;
+                    break;
+                  }
+                }
+              }
+
+              let dotsPerMm = 8;
+              if (sizeMm?.w?.unit === "mm" && sizeMm.w.value > 0 && maxX > 0) {
+                dotsPerMm = Math.max(1, Math.round(maxX / sizeMm.w.value));
+              }
+
+              let widthDots = Math.max(800, maxX + 32);
+              let heightDots = Math.max(600, maxY + 32);
+              if (sizeMm?.w?.unit === "mm" && sizeMm?.h?.unit === "mm") {
+                widthDots = Math.max(widthDots, Math.round(sizeMm.w.value * dotsPerMm));
+                heightDots = Math.max(heightDots, Math.round(sizeMm.h.value * dotsPerMm));
+              }
+
+              return { elements, warnings, widthDots, heightDots, dotsPerMm, sizeMm };
+            }
+
+            function renderTsplPreview(container, parsed) {
+              container.textContent = "";
+              const canvas = document.createElement("canvas");
+              canvas.width = parsed.widthDots;
+              canvas.height = parsed.heightDots;
+              canvas.style.maxWidth = "100%";
+              canvas.style.height = "auto";
+              canvas.style.imageRendering = "auto";
+              const ctx = canvas.getContext("2d");
+              if (!ctx) return;
+
+              function invertRect(x, y, w, h) {
+                const radius = arguments.length >= 5 ? Number(arguments[4]) || 0 : 0;
+                const ix = Math.max(0, Math.floor(x));
+                const iy = Math.max(0, Math.floor(y));
+                const iw = Math.max(0, Math.min(canvas.width - ix, Math.floor(w)));
+                const ih = Math.max(0, Math.min(canvas.height - iy, Math.floor(h)));
+                if (!iw || !ih) return;
+                const img = ctx.getImageData(ix, iy, iw, ih);
+                const d = img.data;
+                const r = Math.max(0, Math.min(radius, iw / 2, ih / 2));
+                for (let i = 0; i < d.length; i += 4) {
+                  if (r) {
+                    const p = i / 4;
+                    const px = p % iw;
+                    const py = (p - px) / iw;
+                    const insideCore = (px >= r && px <= iw - r) || (py >= r && py <= ih - r);
+                    if (!insideCore) {
+                      const cx = px < r ? r : iw - r;
+                      const cy = py < r ? r : ih - r;
+                      const dx = px - cx;
+                      const dy = py - cy;
+                      if (dx * dx + dy * dy > r * r) continue;
+                    }
+                  }
+                  d[i] = 255 - d[i];
+                  d[i + 1] = 255 - d[i + 1];
+                  d[i + 2] = 255 - d[i + 2];
+                }
+                ctx.putImageData(img, ix, iy);
+              }
+
+              function roundedRectPath(x, y, w, h, r) {
+                const rr = Math.max(0, Math.min(r || 0, w / 2, h / 2));
+                ctx.beginPath();
+                if (!rr) {
+                  ctx.rect(x, y, w, h);
+                  return;
+                }
+                ctx.moveTo(x + rr, y);
+                ctx.lineTo(x + w - rr, y);
+                ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+                ctx.lineTo(x + w, y + h - rr);
+                ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+                ctx.lineTo(x + rr, y + h);
+                ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+                ctx.lineTo(x, y + rr);
+                ctx.quadraticCurveTo(x, y, x + rr, y);
+                ctx.closePath();
+              }
+
+              ctx.fillStyle = "#fff";
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.fillStyle = "#000";
+              ctx.strokeStyle = "#000";
+
+              for (const el of parsed.elements) {
+                if (el.kind === "bar") {
+                  ctx.fillStyle = "#000";
+                  ctx.fillRect(el.x, el.y, el.w, el.h);
+                  continue;
+                }
+                if (el.kind === "line") {
+                  ctx.strokeStyle = "#000";
+                  ctx.lineWidth = el.thickness;
+                  ctx.beginPath();
+                  ctx.moveTo(el.x1, el.y1);
+                  ctx.lineTo(el.x2, el.y2);
+                  ctx.stroke();
+                  continue;
+                }
+                if (el.kind === "box") {
+                  const x = Math.min(el.x1, el.x2);
+                  const y = Math.min(el.y1, el.y2);
+                  const w = Math.abs(el.x2 - el.x1);
+                  const h = Math.abs(el.y2 - el.y1);
+                  const filled = el.thickness >= Math.min(w, h) / 2;
+                  if (filled) {
+                    ctx.fillStyle = "#000";
+                    roundedRectPath(x, y, w, h, el.radius || 0);
+                    ctx.fill();
+                  } else {
+                    ctx.strokeStyle = "#000";
+                    ctx.lineWidth = el.thickness;
+                    roundedRectPath(x, y, w, h, el.radius || 0);
+                    ctx.stroke();
+                  }
+                  continue;
+                }
+                if (el.kind === "text") {
+                  const baseFontHeight = 24;
+                  const fontSize = baseFontHeight * (Number.isFinite(el.yMul) ? el.yMul : 1);
+                  ctx.fillStyle = "#000";
+                  ctx.font = `${Math.max(8, Math.round(fontSize))}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+                  ctx.textBaseline = "top";
+                  ctx.save();
+                  ctx.translate(el.x, el.y);
+                  if (el.rotation) ctx.rotate((el.rotation * Math.PI) / 180);
+                  ctx.fillText(String(el.text ?? ""), 0, 0);
+                  ctx.restore();
+                  continue;
+                }
+                if (el.kind === "qrcode") {
+                  const approxModules = 29;
+                  const size = Math.max(21, el.cell * approxModules);
+                  ctx.save();
+                  ctx.translate(el.x, el.y);
+                  if (el.rotation) ctx.rotate((el.rotation * Math.PI) / 180);
+                  ctx.strokeStyle = "#000";
+                  ctx.lineWidth = 2;
+                  ctx.strokeRect(0, 0, size, size);
+                  ctx.fillStyle = "#000";
+                  ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+                  ctx.textBaseline = "top";
+                  ctx.fillText("QR", 6, 6);
+                  ctx.restore();
+                  continue;
+                }
+                if (el.kind === "reverse") {
+                  invertRect(el.x, el.y, el.w, el.h, el.radius || 0);
+                  continue;
+                }
+              }
+
+              container.appendChild(canvas);
+            }
+
+            async function refreshTspl() {
+              if (!state.tsplMounted) {
+                elContent.className = "grid";
+                elContent.innerHTML = `
+                  <section class="card">
+                    <h2 style="font-size: 14px; margin: 0 0 8px 0;">TSPL</h2>
+                    <div class="row" style="margin: 6px 0 10px 0;">
+                      <label>Impressora:</label>
+                      <select id="tspl_printer"></select>
+                      <label>Doc:</label>
+                      <input id="tspl_doc" type="text" style="min-width:160px" />
+                      <label>Encoding:</label>
+                      <select id="tspl_encoding" style="min-width:140px">
+                        <option value="ascii">ascii</option>
+                        <option value="utf-8">utf-8</option>
+                      </select>
+                      <button id="tspl_render">Atualizar prévia</button>
+                      <button id="tspl_print">Imprimir</button>
+                      <span class="muted" id="tspl_status"></span>
+                    </div>
+                    <textarea id="tspl_text" spellcheck="false"></textarea>
+                    <div id="tspl_warnings" class="muted" style="margin-top: 10px;"></div>
+                  </section>
+                  <section class="card">
+                    <h2 style="font-size: 14px; margin: 0 0 8px 0;">Prévia</h2>
+                    <div class="previewWrap">
+                      <div id="tspl_preview" class="previewSurface"></div>
+                    </div>
+                    <div class="muted" id="tspl_meta" style="margin-top: 10px;"></div>
+                  </section>
+                `;
+
+                const elText = document.getElementById("tspl_text");
+                const elWarnings = document.getElementById("tspl_warnings");
+                const elPreview = document.getElementById("tspl_preview");
+                const elMeta = document.getElementById("tspl_meta");
+                const elPrinter = document.getElementById("tspl_printer");
+                const elDoc = document.getElementById("tspl_doc");
+                const elEncoding = document.getElementById("tspl_encoding");
+                const elStatus = document.getElementById("tspl_status");
+
+                elText.value = state.tspl;
+                elDoc.value = state.tsplDocName;
+                elEncoding.value = state.tsplEncoding;
+
+                const printers = await getJson("/api/printers");
+                elPrinter.innerHTML = `<option value="">(selecione)</option>` + printers.map(p => {
+                  const selected = state.tsplPrinter && p.name && String(p.name).toLowerCase() === String(state.tsplPrinter).toLowerCase() ? "selected" : "";
+                  const suffix = p.isDefault ? " (padrão)" : "";
+                  return `<option ${selected} value="${String(p.name).replaceAll('"', "&quot;")}">${p.name}${suffix}</option>`;
+                }).join("");
+
+                function doRender() {
+                  state.tspl = elText.value || "";
+                  localStorage.setItem("printserver_tspl", state.tspl);
+                  const parsed = parseTspl(state.tspl);
+                  renderTsplPreview(elPreview, parsed);
+                  const lines = state.tspl.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n").length;
+                  const size = parsed.sizeMm?.w?.unit === "mm" && parsed.sizeMm?.h?.unit === "mm"
+                    ? `${parsed.sizeMm.w.value}mm x ${parsed.sizeMm.h.value}mm`
+                    : `${parsed.widthDots} x ${parsed.heightDots} dots`;
+                  elMeta.textContent = `Tamanho: ${size} | Escala estimada: ${parsed.dotsPerMm} dots/mm | Linhas: ${lines}`;
+                  if (parsed.warnings.length) {
+                    elWarnings.innerHTML = `<pre style="white-space:pre-wrap; margin:0;">${parsed.warnings.join("\n")}</pre>`;
+                  } else {
+                    elWarnings.textContent = "";
+                  }
+                }
+
+                document.getElementById("tspl_render").addEventListener("click", () => doRender());
+                elText.addEventListener("input", () => {
+                  state.tspl = elText.value || "";
+                  localStorage.setItem("printserver_tspl", state.tspl);
+                });
+                elPrinter.addEventListener("change", () => {
+                  state.tsplPrinter = elPrinter.value || "";
+                  localStorage.setItem("printserver_tspl_printer", state.tsplPrinter);
+                });
+                elDoc.addEventListener("input", () => {
+                  state.tsplDocName = elDoc.value || "tspl";
+                  localStorage.setItem("printserver_tspl_doc", state.tsplDocName);
+                });
+                elEncoding.addEventListener("change", () => {
+                  state.tsplEncoding = elEncoding.value || "ascii";
+                  localStorage.setItem("printserver_tspl_encoding", state.tsplEncoding);
+                });
+
+                document.getElementById("tspl_print").addEventListener("click", async () => {
+                  elStatus.textContent = "";
+                  try {
+                    const printerName = (elPrinter.value || "").trim();
+                    if (!printerName) {
+                      elStatus.textContent = "Selecione uma impressora.";
+                      return;
+                    }
+                    const docName = (elDoc.value || "tspl").trim() || "tspl";
+                    const encoding = (elEncoding.value || "ascii").trim() || "ascii";
+                    const tspl = elText.value || "";
+                    await postJson("/api/print/tspl", { printerName, tspl, documentName: docName, encoding });
+                    elStatus.textContent = "Enviado para impressão.";
+                  } catch (e) {
+                    if (String(e).includes("unauthorized")) return;
+                    elStatus.textContent = String(e);
+                  }
+                });
+
+                doRender();
+                state.tsplMounted = true;
+              }
+            }
+
             async function refresh() {
               const now = new Date();
               elLastRefresh.textContent = "Atualizado em " + now.toLocaleTimeString();
@@ -699,6 +1488,7 @@ static class UiPages
                 if (state.tab === "logs") return await refreshLogs();
                 if (state.tab === "jobs") return await refreshJobs();
                 if (state.tab === "printers") return await refreshPrinters();
+                if (state.tab === "tspl") return await refreshTspl();
               } catch (e) {
                 if (String(e).includes("unauthorized")) return;
                 elContent.innerHTML = `<pre>${String(e)}</pre>`;
@@ -872,4 +1662,72 @@ static partial class RawPrinter
     [LibraryImport("winspool.drv", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, int dwCount, out int dwWritten);
+}
+
+static class PngValidation
+{
+    static readonly byte[] Signature = [137, 80, 78, 71, 13, 10, 26, 10];
+
+    public static bool LooksLikePng(ReadOnlySpan<byte> bytes)
+    {
+        return bytes.Length >= Signature.Length && bytes[..Signature.Length].SequenceEqual(Signature);
+    }
+}
+
+static class BitmapPrinter
+{
+    public static bool PrintPngToPrinter(string printerName, byte[] pngBytes, double widthMm, double heightMm, string documentName)
+    {
+        using var ms = new MemoryStream(pngBytes, writable: false);
+        using var image = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
+
+        using var printDoc = new PrintDocument();
+        printDoc.PrinterSettings.PrinterName = printerName;
+        if (!printDoc.PrinterSettings.IsValid)
+        {
+            return false;
+        }
+
+        printDoc.DocumentName = documentName;
+        printDoc.PrintController = new StandardPrintController();
+        printDoc.OriginAtMargins = false;
+
+        var paperWidthHundredthsInch = (int)Math.Round((widthMm / 25.4) * 100, MidpointRounding.AwayFromZero);
+        var paperHeightHundredthsInch = (int)Math.Round((heightMm / 25.4) * 100, MidpointRounding.AwayFromZero);
+        if (paperWidthHundredthsInch <= 0 || paperHeightHundredthsInch <= 0)
+        {
+            return false;
+        }
+
+        printDoc.DefaultPageSettings.PaperSize = new PaperSize("Custom", paperWidthHundredthsInch, paperHeightHundredthsInch);
+        printDoc.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
+
+        printDoc.PrintPage += (_, e) =>
+        {
+            var g = e.Graphics;
+            if (g is null)
+            {
+                e.HasMorePages = false;
+                return;
+            }
+
+            var dpiX = g.DpiX;
+            var dpiY = g.DpiY;
+            var targetWidthPx = (float)((widthMm / 25.4) * dpiX);
+            var targetHeightPx = (float)((heightMm / 25.4) * dpiY);
+
+            g.PageUnit = GraphicsUnit.Pixel;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.SmoothingMode = SmoothingMode.None;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            g.TranslateTransform(-e.PageSettings.HardMarginX, -e.PageSettings.HardMarginY);
+            g.DrawImage(image, new RectangleF(0, 0, targetWidthPx, targetHeightPx));
+
+            e.HasMorePages = false;
+        };
+
+        printDoc.Print();
+        return true;
+    }
 }
