@@ -1,0 +1,25 @@
+## Build outputs
+[Bb]in/
+[Oo]bj/
+
+## Publish outputs
+**/publish/
+
+## IDE / tooling
+.vs/
+.idea/
+
+## User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Logs
+print-logs.jsonl
+
+## Accidental file
+/.md
+
+## Generated previews
+print-previews/

@@ -3,448 +3,1003 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Printing;
+using System.Diagnostics;
+using Microsoft.Win32;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Windows.Forms;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddCors(options =>
+sealed class Program
 {
-    options.AddDefaultPolicy(policy =>
-        policy
-            .SetIsOriginAllowed(_ => true)
-            .AllowAnyHeader()
-            .AllowAnyMethod());
-});
-builder.Services.AddSingleton<PrintLogStore>();
-
-var app = builder.Build();
-
-var apiKey = builder.Configuration["PrintServer:ApiKey"];
-if (!string.IsNullOrWhiteSpace(apiKey))
-{
-    app.Use(async (context, next) =>
+    [STAThread]
+    public static async Task Main(string[] args)
     {
-        if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
+        var builder = WebApplication.CreateBuilder(args);
+
+        var hasUrlsArg = args.Any(a => string.Equals(a, "--urls", StringComparison.OrdinalIgnoreCase));
+        if (!hasUrlsArg)
         {
-            var header = context.Request.Headers.TryGetValue("X-Api-Key", out var value) ? value.ToString() : null;
-            if (!string.Equals(header, apiKey, StringComparison.Ordinal))
+            var serverConfig = ServerConfigStore.Load();
+            if (serverConfig is not null)
             {
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                await context.Response.WriteAsJsonAsync(new { error = "unauthorized" });
-                return;
+                builder.WebHost.UseUrls(serverConfig.ToUrl());
             }
         }
 
-        await next();
+        builder.Services.AddCors(options =>
+        {
+            options.AddDefaultPolicy(policy =>
+                policy
+                    .SetIsOriginAllowed(_ => true)
+                    .AllowAnyHeader()
+                    .AllowAnyMethod());
+        });
+
+        builder.Services.AddSingleton<PrintLogStore>();
+
+        var app = builder.Build();
+
+        var apiKey = builder.Configuration["PrintServer:ApiKey"];
+        if (!string.IsNullOrWhiteSpace(apiKey))
+        {
+            app.Use(async (context, next) =>
+            {
+                if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
+                {
+                    var header = context.Request.Headers.TryGetValue("X-Api-Key", out var value) ? value.ToString() : null;
+                    if (!string.Equals(header, apiKey, StringComparison.Ordinal))
+                    {
+                        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                        await context.Response.WriteAsJsonAsync(new { error = "unauthorized" });
+                        return;
+                    }
+                }
+
+                await next();
+            });
+        }
+
+        app.UseCors();
+
+        app.MapGet("/", () =>
+            Results.Ok(new
+            {
+                name = "PrintServer",
+                endpoints = AppMetadata.RootEndpoints
+            }));
+
+        app.MapGet("/ui", () => Results.Text(UiPages.Index, "text/html; charset=utf-8"));
+
+        app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
+        app.MapGet("/api/printers", () =>
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT Name, Default FROM Win32_Printer");
+
+            var printers = searcher
+                .Get()
+                .Cast<ManagementBaseObject>()
+                .Select(printer => new
+                {
+                    name = printer["Name"]?.ToString(),
+                    isDefault = printer["Default"] is bool b && b
+                })
+                .Where(p => !string.IsNullOrWhiteSpace(p.name))
+                .OrderBy(p => p.name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            return Results.Ok(printers);
+        });
+
+        app.MapGet("/api/printers/status", () =>
+        {
+            using var searcher = new ManagementObjectSearcher("""
+                SELECT Name, Default, WorkOffline, PrinterStatus, Status, ExtendedPrinterStatus, DetectedErrorState
+                FROM Win32_Printer
+                """);
+
+            var printers = searcher
+                .Get()
+                .Cast<ManagementBaseObject>()
+                .Select(printer => new PrinterStatusDto(
+                    Name: printer["Name"]?.ToString() ?? "",
+                    IsDefault: printer["Default"] is bool b && b,
+                    WorkOffline: printer["WorkOffline"] is bool w && w,
+                    PrinterStatus: printer["PrinterStatus"] is ushort ps ? ps : null,
+                    Status: printer["Status"]?.ToString(),
+                    ExtendedPrinterStatus: printer["ExtendedPrinterStatus"] is uint eps ? eps : null,
+                    DetectedErrorState: printer["DetectedErrorState"] is uint des ? des : null))
+                .Where(p => !string.IsNullOrWhiteSpace(p.Name))
+                .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            return Results.Ok(printers);
+        });
+
+        app.MapGet("/api/jobs/active", () =>
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PrintJob");
+
+            var jobs = searcher
+                .Get()
+                .Cast<ManagementBaseObject>()
+                .Select(job =>
+                {
+                    var name = job["Name"]?.ToString() ?? "";
+                    var (printerName, jobId) = PrintJobNameParser.TryParse(name);
+
+                    DateTimeOffset? timeSubmitted = null;
+                    var timeSubmittedRaw = job["TimeSubmitted"]?.ToString();
+                    if (!string.IsNullOrWhiteSpace(timeSubmittedRaw))
+                    {
+                        try
+                        {
+                            var dt = ManagementDateTimeConverter.ToDateTime(timeSubmittedRaw);
+                            timeSubmitted = new DateTimeOffset(dt);
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    return new PrintJobDto(
+                        PrinterName: printerName,
+                        JobId: jobId,
+                        Document: job["Document"]?.ToString(),
+                        Owner: job["Owner"]?.ToString(),
+                        Status: job["Status"]?.ToString(),
+                        JobStatus: job["JobStatus"]?.ToString(),
+                        TotalPages: job["TotalPages"] is uint tp ? tp : null,
+                        PagesPrinted: job["PagesPrinted"] is uint pp ? pp : null,
+                        SizeBytes: job["Size"] is uint s ? s : null,
+                        TimeSubmitted: timeSubmitted);
+                })
+                .OrderByDescending(j => j.TimeSubmitted)
+                .ThenBy(j => j.PrinterName, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            return Results.Ok(jobs);
+        });
+
+        app.MapGet("/api/logs", (int? take, PrintLogStore logStore) =>
+        {
+            var boundedTake = Math.Clamp(take ?? 200, 1, 5000);
+            return Results.Ok(logStore.GetLatest(boundedTake));
+        });
+
+app.MapGet("/api/config", () =>
+{
+    var config = ServerConfigStore.Load() ?? new ServerConfigDto(ListenAll: true, Host: "localhost", Port: 5000);
+    var effectiveUrls = app.Urls.ToArray();
+
+    var (scheme, port) = NetworkInfo.GetPrimarySchemeAndPort(effectiveUrls, fallbackPort: config.Port);
+    var localUrl = NetworkInfo.BuildLocalUrl(scheme, port);
+    var lanUrls = NetworkInfo.BuildLanUrls(scheme, port);
+
+    return Results.Ok(new
+    {
+        config = new { listenAll = config.ListenAll, host = config.Host, port = config.Port },
+        effectiveUrls,
+        localUrl,
+        lanUrls
     });
+});
+
+app.MapPost("/api/config", (ServerConfigUpdateRequest body) =>
+{
+    var next = ServerConfigStore.Normalize(body);
+    if (next is null)
+    {
+        return Results.BadRequest(new { error = "invalid_config" });
+    }
+
+    ServerConfigStore.Save(next);
+    return Results.Ok(new { status = "saved", url = next.ToUrl(), restartRequired = true });
+});
+
+        app.MapDelete("/api/logs", async (PrintLogStore logStore) =>
+        {
+            await logStore.ClearAsync();
+            return Results.Ok(new { status = "cleared" });
+        });
+
+        app.MapPost("/api/print/raw", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory) =>
+        {
+            var logger = loggerFactory.CreateLogger("PrintServer");
+
+            var body = await request.ReadFromJsonAsync<RawPrintRequest>();
+            if (body is null)
+            {
+                return Results.BadRequest(new { error = "invalid_body" });
+            }
+
+            if (string.IsNullOrWhiteSpace(body.PrinterName))
+            {
+                return Results.BadRequest(new { error = "printerName_required" });
+            }
+
+            if (!PrinterDiscovery.Exists(body.PrinterName))
+            {
+                return Results.NotFound(new { error = "printer_not_found" });
+            }
+
+            if (string.IsNullOrWhiteSpace(body.DataBase64))
+            {
+                return Results.BadRequest(new { error = "dataBase64_required" });
+            }
+
+            byte[] bytes;
+            try
+            {
+                bytes = Convert.FromBase64String(body.DataBase64);
+            }
+            catch
+            {
+                return Results.BadRequest(new { error = "dataBase64_invalid" });
+            }
+
+            var ok = RawPrinter.SendBytesToPrinter(body.PrinterName, bytes, body.DocumentName ?? "raw-print");
+            var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
+            var entry = new PrintLogEntry(
+                Id: Guid.NewGuid(),
+                Timestamp: DateTimeOffset.UtcNow,
+                Kind: "raw",
+                PrinterName: body.PrinterName,
+                DocumentName: body.DocumentName ?? "raw-print",
+                BytesLength: bytes.Length,
+                Status: ok ? "queued" : "failed",
+                Error: ok ? null : "print_failed",
+                RemoteIp: remoteIp);
+
+            await logStore.AppendAsync(entry);
+            if (ok)
+            {
+                if (logger.IsEnabled(LogLevel.Information))
+                {
+                    logger.LogInformation("Queued RAW print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+                }
+            }
+            else
+            {
+                if (logger.IsEnabled(LogLevel.Warning))
+                {
+                    logger.LogWarning("RAW print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+                }
+            }
+
+            return ok
+                ? Results.Ok(new { status = "queued" })
+                : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
+        });
+
+        app.MapPost("/api/print/tspl", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory) =>
+        {
+            var logger = loggerFactory.CreateLogger("PrintServer");
+
+            var body = await request.ReadFromJsonAsync<TsplPrintRequest>();
+            if (body is null)
+            {
+                return Results.BadRequest(new { error = "invalid_body" });
+            }
+
+            if (string.IsNullOrWhiteSpace(body.PrinterName))
+            {
+                return Results.BadRequest(new { error = "printerName_required" });
+            }
+
+            if (!PrinterDiscovery.Exists(body.PrinterName))
+            {
+                return Results.NotFound(new { error = "printer_not_found" });
+            }
+
+            if (string.IsNullOrWhiteSpace(body.Tspl))
+            {
+                return Results.BadRequest(new { error = "tspl_required" });
+            }
+
+            var encoding = body.Encoding?.Trim().ToLowerInvariant() switch
+            {
+                null or "" or "ascii" => Encoding.ASCII,
+                "utf8" or "utf-8" => Encoding.UTF8,
+                _ => Encoding.ASCII
+            };
+
+            var payload = body.Tspl;
+            if (!payload.EndsWith('\n'))
+            {
+                payload += "\r\n";
+            }
+
+            var bytes = encoding.GetBytes(payload);
+            var ok = RawPrinter.SendBytesToPrinter(body.PrinterName, bytes, body.DocumentName ?? "tspl");
+
+            var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
+            var entry = new PrintLogEntry(
+                Id: Guid.NewGuid(),
+                Timestamp: DateTimeOffset.UtcNow,
+                Kind: "tspl",
+                PrinterName: body.PrinterName,
+                DocumentName: body.DocumentName ?? "tspl",
+                BytesLength: bytes.Length,
+                Status: ok ? "queued" : "failed",
+                Error: ok ? null : "print_failed",
+                RemoteIp: remoteIp);
+
+            await logStore.AppendAsync(entry);
+            if (ok)
+            {
+                if (logger.IsEnabled(LogLevel.Information))
+                {
+                    logger.LogInformation("Queued TSPL print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+                }
+            }
+            else
+            {
+                if (logger.IsEnabled(LogLevel.Warning))
+                {
+                    logger.LogWarning("TSPL print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+                }
+            }
+
+            return ok
+                ? Results.Ok(new { status = "queued" })
+                : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
+        });
+
+        app.MapPost("/api/print/image", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory, IConfiguration configuration) =>
+        {
+            var logger = loggerFactory.CreateLogger("PrintServer");
+
+            var body = await request.ReadFromJsonAsync<ImagePrintRequest>();
+            if (body is null)
+            {
+                return Results.BadRequest(new { error = "invalid_body" });
+            }
+
+            if (string.IsNullOrWhiteSpace(body.PrinterName))
+            {
+                return Results.BadRequest(new { error = "printerName_required" });
+            }
+
+            if (!PrinterDiscovery.Exists(body.PrinterName))
+            {
+                return Results.NotFound(new { error = "printer_not_found" });
+            }
+
+            if (!string.Equals(body.MimeType?.Trim(), "image/png", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.BadRequest(new { error = "mimeType_invalid" });
+            }
+
+            if (string.IsNullOrWhiteSpace(body.ImageBase64))
+            {
+                return Results.BadRequest(new { error = "imageBase64_required" });
+            }
+
+            if (body.Label is null)
+            {
+                return Results.BadRequest(new { error = "label_required" });
+            }
+
+            if (body.Label.WidthMm <= 0 || body.Label.HeightMm <= 0 || body.Label.Dpi <= 0 || body.Label.WidthPx <= 0 || body.Label.HeightPx <= 0)
+            {
+                return Results.BadRequest(new { error = "label_invalid" });
+            }
+
+            var ratioMm = body.Label.WidthMm / body.Label.HeightMm;
+            var ratioPx = (double)body.Label.WidthPx / body.Label.HeightPx;
+            var ratioDiff = Math.Abs(ratioPx - ratioMm) / ratioMm;
+            if (ratioDiff > 0.01)
+            {
+                return Results.BadRequest(new { error = "label_aspect_ratio_mismatch" });
+            }
+
+            var maxImageBytes = Math.Clamp(configuration.GetValue("PrintServer:MaxImageBytes", 8_000_000), 50_000, 50_000_000);
+            var maxBase64Chars = (int)Math.Ceiling(maxImageBytes / 3d) * 4 + 16;
+            if (body.ImageBase64.Length > maxBase64Chars)
+            {
+                return Results.BadRequest(new { error = "payload_too_large" });
+            }
+
+            byte[] pngBytes;
+            try
+            {
+                pngBytes = Convert.FromBase64String(body.ImageBase64);
+            }
+            catch
+            {
+                return Results.BadRequest(new { error = "imageBase64_invalid" });
+            }
+
+            if (pngBytes.Length > maxImageBytes)
+            {
+                return Results.BadRequest(new { error = "payload_too_large" });
+            }
+
+            if (!PngValidation.LooksLikePng(pngBytes))
+            {
+                return Results.BadRequest(new { error = "png_invalid" });
+            }
+
+            int actualWidthPx;
+            int actualHeightPx;
+            try
+            {
+                using var ms = new MemoryStream(pngBytes, writable: false);
+                using var img = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
+                if (!img.RawFormat.Equals(ImageFormat.Png))
+                {
+                    return Results.BadRequest(new { error = "png_invalid" });
+                }
+
+                actualWidthPx = img.Width;
+                actualHeightPx = img.Height;
+            }
+            catch
+            {
+                return Results.BadRequest(new { error = "png_invalid" });
+            }
+
+            if (actualWidthPx != body.Label.WidthPx || actualHeightPx != body.Label.HeightPx)
+            {
+                return Results.BadRequest(new { error = "label_pixels_mismatch" });
+            }
+
+            var documentName = string.IsNullOrWhiteSpace(body.DocumentName) ? "image" : body.DocumentName.Trim();
+            bool ok;
+            try
+            {
+                ok = BitmapPrinter.PrintPngToPrinter(body.PrinterName, pngBytes, body.Label.WidthMm, body.Label.HeightMm, documentName);
+            }
+            catch (Exception ex)
+            {
+                if (logger.IsEnabled(LogLevel.Warning))
+                {
+                    logger.LogWarning(ex, "Bitmap print failed: printer={PrinterName} doc={DocumentName}", body.PrinterName, documentName);
+                }
+                ok = false;
+            }
+
+            var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
+            var entry = new PrintLogEntry(
+                Id: Guid.NewGuid(),
+                Timestamp: DateTimeOffset.UtcNow,
+                Kind: "image",
+                PrinterName: body.PrinterName,
+                DocumentName: documentName,
+                BytesLength: pngBytes.Length,
+                Status: ok ? "queued" : "failed",
+                Error: ok ? null : "print_failed",
+                RemoteIp: remoteIp);
+
+            await logStore.AppendAsync(entry);
+            if (ok)
+            {
+                if (logger.IsEnabled(LogLevel.Information))
+                {
+                    logger.LogInformation("Queued image print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+                }
+            }
+            else
+            {
+                if (logger.IsEnabled(LogLevel.Warning))
+                {
+                    logger.LogWarning("Image print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
+                }
+            }
+
+            return ok
+                ? Results.Ok(new { status = "queued" })
+                : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
+        });
+
+        var runConsole = args.Any(a => string.Equals(a, "--console", StringComparison.OrdinalIgnoreCase));
+        var silent = args.Any(a => string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase));
+        if (Environment.UserInteractive && !runConsole)
+        {
+            await RunInTrayAsync(app, silent);
+            return;
+        }
+
+        await app.RunAsync();
+    }
+
+    static async Task RunInTrayAsync(WebApplication app, bool silent)
+    {
+        Application.SetHighDpiMode(HighDpiMode.SystemAware);
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+
+        var restartRequested = false;
+        Icon? trayIcon = null;
+        app.MapPost("/api/restart", () =>
+        {
+            if (!Environment.UserInteractive)
+            {
+                return Results.BadRequest(new { error = "not_interactive" });
+            }
+
+            restartRequested = true;
+            Application.Exit();
+            return Results.Ok(new { status = "restarting" });
+        });
+
+        await app.StartAsync();
+
+        var (scheme, port) = NetworkInfo.GetPrimarySchemeAndPort(app.Urls.ToArray(), fallbackPort: 5000);
+        var localUrl = NetworkInfo.BuildLocalUrl(scheme, port);
+        var lanUrls = NetworkInfo.BuildLanUrls(scheme, port);
+        var lanUrl = lanUrls.FirstOrDefault();
+        var preferredUrl = lanUrl ?? localUrl;
+
+        var uiUrl = $"{preferredUrl.TrimEnd('/')}/ui";
+        var configUrl = $"{uiUrl}?tab=config";
+        var autoStart = AutoStart.IsEnabled();
+
+        using var menu = new ContextMenuStrip();
+        menu.Items.Add("Abrir UI", null, (_, _) => OpenUrl(uiUrl));
+        menu.Items.Add("Configuração", null, (_, _) => OpenUrl(configUrl));
+        menu.Items.Add("Copiar URL", null, (_, _) => Clipboard.SetText(preferredUrl));
+        menu.Items.Add("Copiar URL (LAN)", null, (_, _) =>
+        {
+            Clipboard.SetText(lanUrl ?? preferredUrl);
+        });
+        menu.Items.Add("Copiar URL (Local)", null, (_, _) => Clipboard.SetText(localUrl));
+        var autoStartItem = new ToolStripMenuItem("Iniciar com o Windows")
+        {
+            Checked = autoStart,
+            CheckOnClick = false
+        };
+        autoStartItem.Click += (_, _) =>
+        {
+            var enabled = AutoStart.IsEnabled();
+            var next = !enabled;
+            AutoStart.SetEnabled(next);
+            autoStartItem.Checked = next;
+        };
+        menu.Items.Add(autoStartItem);
+        menu.Items.Add("Reiniciar", null, (_, _) =>
+        {
+            restartRequested = true;
+            Application.Exit();
+        });
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Sair", null, (_, _) => Application.Exit());
+
+        trayIcon = TryCreateTrayIcon() ?? SystemIcons.Application;
+        using var tray = new NotifyIcon
+        {
+            Icon = trayIcon,
+            Text = "PrintServer",
+            Visible = true,
+            ContextMenuStrip = menu
+        };
+
+        tray.DoubleClick += (_, _) => OpenUrl(uiUrl);
+        if (!silent)
+        {
+            var shownUrl = preferredUrl;
+            tray.ShowBalloonTip(2000, "PrintServer", $"Rodando em {shownUrl}", ToolTipIcon.Info);
+        }
+
+        try
+        {
+            Application.Run();
+        }
+        finally
+        {
+            tray.Visible = false;
+            await app.StopAsync();
+            await app.DisposeAsync();
+            trayIcon?.Dispose();
+
+            if (restartRequested)
+            {
+                RestartSelf();
+            }
+        }
+    }
+
+    static void OpenUrl(string url)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = url,
+                UseShellExecute = true
+            });
+        }
+        catch
+        {
+        }
+    }
+
+    static void RestartSelf()
+    {
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            exePath = Application.ExecutablePath;
+        }
+
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            return;
+        }
+
+        var args = Environment.GetCommandLineArgs().Skip(1).ToArray();
+        var argText = string.Join(" ", args.Select(QuoteArg));
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = exePath,
+                Arguments = argText,
+                UseShellExecute = false
+            });
+        }
+        catch
+        {
+        }
+    }
+
+    static string QuoteArg(string arg)
+    {
+        if (string.IsNullOrEmpty(arg))
+        {
+            return "\"\"";
+        }
+
+        var mustQuote = arg.Any(char.IsWhiteSpace) || arg.Contains('"');
+        if (!mustQuote)
+        {
+            return arg;
+        }
+
+        var escaped = arg.Replace("\"", "\\\"");
+        return $"\"{escaped}\"";
+    }
+
+    static Icon? TryCreateTrayIcon()
+    {
+        var fromLogo = TryCreateTrayIconFromEmbeddedLogo();
+        if (fromLogo is not null)
+        {
+            return fromLogo;
+        }
+
+        try
+        {
+            using var bmp = new Bitmap(64, 64, PixelFormat.Format32bppArgb);
+            using var g = Graphics.FromImage(bmp);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Color.Transparent);
+
+            using (var bg = new SolidBrush(Color.FromArgb(255, 36, 108, 224)))
+            {
+                g.FillEllipse(bg, 2, 2, 60, 60);
+            }
+
+            using (var white = new SolidBrush(Color.White))
+            using (var font = new Font("Segoe UI", 28, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                g.DrawString("P", font, white, new RectangleF(0, -2, 64, 64), sf);
+            }
+
+            var hIcon = bmp.GetHicon();
+            try
+            {
+                using var tmp = Icon.FromHandle(hIcon);
+                return (Icon)tmp.Clone();
+            }
+            finally
+            {
+                DestroyIcon(hIcon);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    static Icon? TryCreateTrayIconFromEmbeddedLogo()
+    {
+        Stream? stream;
+        try
+        {
+            stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("PrintServer.TrayIcon.png");
+        }
+        catch
+        {
+            stream = null;
+        }
+
+        if (stream is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var _ = stream;
+            using var src = new Bitmap(stream);
+
+            using var bmp = new Bitmap(64, 64, PixelFormat.Format32bppArgb);
+            using var g = Graphics.FromImage(bmp);
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.SmoothingMode = SmoothingMode.HighQuality;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.Clear(Color.Transparent);
+            g.DrawImage(src, new Rectangle(0, 0, 64, 64));
+
+            var hIcon = bmp.GetHicon();
+            try
+            {
+                using var tmp = Icon.FromHandle(hIcon);
+                return (Icon)tmp.Clone();
+            }
+            finally
+            {
+                DestroyIcon(hIcon);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool DestroyIcon(IntPtr hIcon);
 }
 
-app.UseCors();
+static class AutoStart
+{
+    const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string ValueName = "PrintServer";
 
-app.MapGet("/", () =>
-    Results.Ok(new
+    public static bool IsEnabled()
     {
-        name = "PrintServer",
-        endpoints = AppMetadata.RootEndpoints
-    }));
+        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
+        var value = key?.GetValue(ValueName)?.ToString();
+        return !string.IsNullOrWhiteSpace(value);
+    }
 
-app.MapGet("/ui", () => Results.Text(UiPages.Index, "text/html; charset=utf-8"));
-
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-
-app.MapGet("/api/printers", () =>
-{
-    using var searcher = new ManagementObjectSearcher("SELECT Name, Default FROM Win32_Printer");
-
-    var printers = searcher
-        .Get()
-        .Cast<ManagementBaseObject>()
-        .Select(printer => new
+    public static void SetEnabled(bool enabled)
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true);
+        if (key is null)
         {
-            name = printer["Name"]?.ToString(),
-            isDefault = printer["Default"] is bool b && b
-        })
-        .Where(p => !string.IsNullOrWhiteSpace(p.name))
-        .OrderBy(p => p.name, StringComparer.OrdinalIgnoreCase)
-        .ToArray();
+            return;
+        }
 
-    return Results.Ok(printers);
-});
-
-app.MapGet("/api/printers/status", () =>
-{
-    using var searcher = new ManagementObjectSearcher("""
-        SELECT Name, Default, WorkOffline, PrinterStatus, Status, ExtendedPrinterStatus, DetectedErrorState
-        FROM Win32_Printer
-        """);
-
-    var printers = searcher
-        .Get()
-        .Cast<ManagementBaseObject>()
-        .Select(printer => new PrinterStatusDto(
-            Name: printer["Name"]?.ToString() ?? "",
-            IsDefault: printer["Default"] is bool b && b,
-            WorkOffline: printer["WorkOffline"] is bool w && w,
-            PrinterStatus: printer["PrinterStatus"] is ushort ps ? ps : null,
-            Status: printer["Status"]?.ToString(),
-            ExtendedPrinterStatus: printer["ExtendedPrinterStatus"] is uint eps ? eps : null,
-            DetectedErrorState: printer["DetectedErrorState"] is uint des ? des : null))
-        .Where(p => !string.IsNullOrWhiteSpace(p.Name))
-        .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
-        .ToArray();
-
-    return Results.Ok(printers);
-});
-
-app.MapGet("/api/jobs/active", () =>
-{
-    using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PrintJob");
-
-    var jobs = searcher
-        .Get()
-        .Cast<ManagementBaseObject>()
-        .Select(job =>
+        if (!enabled)
         {
-            var name = job["Name"]?.ToString() ?? "";
-            var (printerName, jobId) = PrintJobNameParser.TryParse(name);
+            key.DeleteValue(ValueName, throwOnMissingValue: false);
+            return;
+        }
 
-            DateTimeOffset? timeSubmitted = null;
-            var timeSubmittedRaw = job["TimeSubmitted"]?.ToString();
-            if (!string.IsNullOrWhiteSpace(timeSubmittedRaw))
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            exePath = Application.ExecutablePath;
+        }
+
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            return;
+        }
+
+        var command = $"\"{exePath}\" --silent";
+        key.SetValue(ValueName, command, RegistryValueKind.String);
+    }
+}
+
+sealed record ServerConfigDto(bool ListenAll, string Host, int Port)
+{
+    public string ToUrl()
+    {
+        var port = Math.Clamp(Port, 1, 65535);
+        if (ListenAll)
+        {
+            return $"http://0.0.0.0:{port}";
+        }
+
+        var host = string.IsNullOrWhiteSpace(Host) ? "localhost" : Host.Trim();
+        return $"http://{host}:{port}";
+    }
+}
+
+sealed record ServerConfigUpdateRequest(bool? ListenAll, string? Host, int? Port);
+
+static class ServerConfigStore
+{
+    const string FileName = "server-config.json";
+
+    public static ServerConfigDto? Load()
+    {
+        var path = GetPath();
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(path, Encoding.UTF8);
+            var dto = JsonSerializer.Deserialize<ServerConfigDto>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            return Normalize(dto);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static void Save(ServerConfigDto config)
+    {
+        var path = GetPath();
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        var json = JsonSerializer.Serialize(config, new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true });
+        File.WriteAllText(path, json, Encoding.UTF8);
+    }
+
+    public static ServerConfigDto? Normalize(ServerConfigUpdateRequest update)
+    {
+        var current = Load() ?? new ServerConfigDto(ListenAll: true, Host: "localhost", Port: 5000);
+        var next = new ServerConfigDto(
+            ListenAll: update.ListenAll ?? current.ListenAll,
+            Host: update.Host ?? current.Host,
+            Port: update.Port ?? current.Port);
+        return Normalize(next);
+    }
+
+    static ServerConfigDto? Normalize(ServerConfigDto? dto)
+    {
+        if (dto is null)
+        {
+            return null;
+        }
+
+        var port = dto.Port;
+        if (port < 1 || port > 65535)
+        {
+            return null;
+        }
+
+        var host = (dto.Host ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            host = "localhost";
+        }
+
+        if (!dto.ListenAll)
+        {
+            if (string.Equals(host, "0.0.0.0", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(host, "0:0:0:0:0:0:0:0", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(host, "::", StringComparison.OrdinalIgnoreCase))
             {
-                try
-                {
-                    var dt = ManagementDateTimeConverter.ToDateTime(timeSubmittedRaw);
-                    timeSubmitted = new DateTimeOffset(dt);
-                }
-                catch
-                {
-                }
+                return null;
             }
 
-            return new PrintJobDto(
-                PrinterName: printerName,
-                JobId: jobId,
-                Document: job["Document"]?.ToString(),
-                Owner: job["Owner"]?.ToString(),
-                Status: job["Status"]?.ToString(),
-                JobStatus: job["JobStatus"]?.ToString(),
-                TotalPages: job["TotalPages"] is uint tp ? tp : null,
-                PagesPrinted: job["PagesPrinted"] is uint pp ? pp : null,
-                SizeBytes: job["Size"] is uint s ? s : null,
-                TimeSubmitted: timeSubmitted);
-        })
-        .OrderByDescending(j => j.TimeSubmitted)
-        .ThenBy(j => j.PrinterName, StringComparer.OrdinalIgnoreCase)
-        .ToArray();
+            if (host.Contains(' '))
+            {
+                return null;
+            }
+        }
 
-    return Results.Ok(jobs);
-});
+        return new ServerConfigDto(dto.ListenAll, host, port);
+    }
 
-app.MapGet("/api/logs", (int? take, PrintLogStore logStore) =>
+    static string GetPath()
+    {
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PrintServer");
+        return Path.Combine(dir, FileName);
+    }
+}
+
+static class NetworkInfo
 {
-    var boundedTake = Math.Clamp(take ?? 200, 1, 5000);
-    return Results.Ok(logStore.GetLatest(boundedTake));
-});
-
-app.MapDelete("/api/logs", async (PrintLogStore logStore) =>
-{
-    await logStore.ClearAsync();
-    return Results.Ok(new { status = "cleared" });
-});
-
-app.MapPost("/api/print/raw", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory) =>
-{
-    var logger = loggerFactory.CreateLogger("PrintServer");
-
-    var body = await request.ReadFromJsonAsync<RawPrintRequest>();
-    if (body is null)
+    public static (string Scheme, int Port) GetPrimarySchemeAndPort(string[] urls, int fallbackPort)
     {
-        return Results.BadRequest(new { error = "invalid_body" });
-    }
-
-    if (string.IsNullOrWhiteSpace(body.PrinterName))
-    {
-        return Results.BadRequest(new { error = "printerName_required" });
-    }
-
-    if (!PrinterDiscovery.Exists(body.PrinterName))
-    {
-        return Results.NotFound(new { error = "printer_not_found" });
-    }
-
-    if (string.IsNullOrWhiteSpace(body.DataBase64))
-    {
-        return Results.BadRequest(new { error = "dataBase64_required" });
-    }
-
-    byte[] bytes;
-    try
-    {
-        bytes = Convert.FromBase64String(body.DataBase64);
-    }
-    catch
-    {
-        return Results.BadRequest(new { error = "dataBase64_invalid" });
-    }
-
-    var ok = RawPrinter.SendBytesToPrinter(body.PrinterName, bytes, body.DocumentName ?? "raw-print");
-    var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
-    var entry = new PrintLogEntry(
-        Id: Guid.NewGuid(),
-        Timestamp: DateTimeOffset.UtcNow,
-        Kind: "raw",
-        PrinterName: body.PrinterName,
-        DocumentName: body.DocumentName ?? "raw-print",
-        BytesLength: bytes.Length,
-        Status: ok ? "queued" : "failed",
-        Error: ok ? null : "print_failed",
-        RemoteIp: remoteIp);
-
-    await logStore.AppendAsync(entry);
-    if (ok)
-    {
-        if (logger.IsEnabled(LogLevel.Information))
+        foreach (var url in urls)
         {
-            logger.LogInformation("Queued RAW print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
-        }
-    }
-    else
-    {
-        if (logger.IsEnabled(LogLevel.Warning))
-        {
-            logger.LogWarning("RAW print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
-        }
-    }
-
-    return ok
-        ? Results.Ok(new { status = "queued" })
-        : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
-});
-
-app.MapPost("/api/print/tspl", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory) =>
-{
-    var logger = loggerFactory.CreateLogger("PrintServer");
-
-    var body = await request.ReadFromJsonAsync<TsplPrintRequest>();
-    if (body is null)
-    {
-        return Results.BadRequest(new { error = "invalid_body" });
-    }
-
-    if (string.IsNullOrWhiteSpace(body.PrinterName))
-    {
-        return Results.BadRequest(new { error = "printerName_required" });
-    }
-
-    if (!PrinterDiscovery.Exists(body.PrinterName))
-    {
-        return Results.NotFound(new { error = "printer_not_found" });
-    }
-
-    if (string.IsNullOrWhiteSpace(body.Tspl))
-    {
-        return Results.BadRequest(new { error = "tspl_required" });
-    }
-
-    var encoding = body.Encoding?.Trim().ToLowerInvariant() switch
-    {
-        null or "" or "ascii" => Encoding.ASCII,
-        "utf8" or "utf-8" => Encoding.UTF8,
-        _ => Encoding.ASCII
-    };
-
-    var payload = body.Tspl;
-    if (!payload.EndsWith('\n'))
-    {
-        payload += "\r\n";
-    }
-
-    var bytes = encoding.GetBytes(payload);
-    var ok = RawPrinter.SendBytesToPrinter(body.PrinterName, bytes, body.DocumentName ?? "tspl");
-
-    var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
-    var entry = new PrintLogEntry(
-        Id: Guid.NewGuid(),
-        Timestamp: DateTimeOffset.UtcNow,
-        Kind: "tspl",
-        PrinterName: body.PrinterName,
-        DocumentName: body.DocumentName ?? "tspl",
-        BytesLength: bytes.Length,
-        Status: ok ? "queued" : "failed",
-        Error: ok ? null : "print_failed",
-        RemoteIp: remoteIp);
-
-    await logStore.AppendAsync(entry);
-    if (ok)
-    {
-        if (logger.IsEnabled(LogLevel.Information))
-        {
-            logger.LogInformation("Queued TSPL print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
-        }
-    }
-    else
-    {
-        if (logger.IsEnabled(LogLevel.Warning))
-        {
-            logger.LogWarning("TSPL print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
-        }
-    }
-
-    return ok
-        ? Results.Ok(new { status = "queued" })
-        : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
-});
-
-app.MapPost("/api/print/image", async (HttpRequest request, PrintLogStore logStore, ILoggerFactory loggerFactory, IConfiguration configuration) =>
-{
-    var logger = loggerFactory.CreateLogger("PrintServer");
-
-    var body = await request.ReadFromJsonAsync<ImagePrintRequest>();
-    if (body is null)
-    {
-        return Results.BadRequest(new { error = "invalid_body" });
-    }
-
-    if (string.IsNullOrWhiteSpace(body.PrinterName))
-    {
-        return Results.BadRequest(new { error = "printerName_required" });
-    }
-
-    if (!PrinterDiscovery.Exists(body.PrinterName))
-    {
-        return Results.NotFound(new { error = "printer_not_found" });
-    }
-
-    if (!string.Equals(body.MimeType?.Trim(), "image/png", StringComparison.OrdinalIgnoreCase))
-    {
-        return Results.BadRequest(new { error = "mimeType_invalid" });
-    }
-
-    if (string.IsNullOrWhiteSpace(body.ImageBase64))
-    {
-        return Results.BadRequest(new { error = "imageBase64_required" });
-    }
-
-    if (body.Label is null)
-    {
-        return Results.BadRequest(new { error = "label_required" });
-    }
-
-    if (body.Label.WidthMm <= 0 || body.Label.HeightMm <= 0 || body.Label.Dpi <= 0 || body.Label.WidthPx <= 0 || body.Label.HeightPx <= 0)
-    {
-        return Results.BadRequest(new { error = "label_invalid" });
-    }
-
-    var ratioMm = body.Label.WidthMm / body.Label.HeightMm;
-    var ratioPx = (double)body.Label.WidthPx / body.Label.HeightPx;
-    var ratioDiff = Math.Abs(ratioPx - ratioMm) / ratioMm;
-    if (ratioDiff > 0.01)
-    {
-        return Results.BadRequest(new { error = "label_aspect_ratio_mismatch" });
-    }
-
-    var maxImageBytes = Math.Clamp(configuration.GetValue("PrintServer:MaxImageBytes", 8_000_000), 50_000, 50_000_000);
-    var maxBase64Chars = (int)Math.Ceiling(maxImageBytes / 3d) * 4 + 16;
-    if (body.ImageBase64.Length > maxBase64Chars)
-    {
-        return Results.BadRequest(new { error = "payload_too_large" });
-    }
-
-    byte[] pngBytes;
-    try
-    {
-        pngBytes = Convert.FromBase64String(body.ImageBase64);
-    }
-    catch
-    {
-        return Results.BadRequest(new { error = "imageBase64_invalid" });
-    }
-
-    if (pngBytes.Length > maxImageBytes)
-    {
-        return Results.BadRequest(new { error = "payload_too_large" });
-    }
-
-    if (!PngValidation.LooksLikePng(pngBytes))
-    {
-        return Results.BadRequest(new { error = "png_invalid" });
-    }
-
-    int actualWidthPx;
-    int actualHeightPx;
-    try
-    {
-        using var ms = new MemoryStream(pngBytes, writable: false);
-        using var img = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
-        if (!img.RawFormat.Equals(ImageFormat.Png))
-        {
-            return Results.BadRequest(new { error = "png_invalid" });
+            if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                var scheme = string.IsNullOrWhiteSpace(uri.Scheme) ? "http" : uri.Scheme;
+                var port = uri.IsDefaultPort ? fallbackPort : uri.Port;
+                if (port >= 1 && port <= 65535)
+                {
+                    return (scheme, port);
+                }
+            }
         }
 
-        actualWidthPx = img.Width;
-        actualHeightPx = img.Height;
-    }
-    catch
-    {
-        return Results.BadRequest(new { error = "png_invalid" });
+        return ("http", Math.Clamp(fallbackPort, 1, 65535));
     }
 
-    if (actualWidthPx != body.Label.WidthPx || actualHeightPx != body.Label.HeightPx)
+    public static string[] BuildLanUrls(string scheme, int port)
     {
-        return Results.BadRequest(new { error = "label_pixels_mismatch" });
+        var ips = GetLanIpv4Addresses();
+        return ips.Select(ip => $"{scheme}://{ip}:{port}").ToArray();
     }
 
-    var documentName = string.IsNullOrWhiteSpace(body.DocumentName) ? "image" : body.DocumentName.Trim();
-    bool ok;
-    try
+    public static string BuildLocalUrl(string scheme, int port)
     {
-        ok = BitmapPrinter.PrintPngToPrinter(body.PrinterName, pngBytes, body.Label.WidthMm, body.Label.HeightMm, documentName);
+        var safeScheme = string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase) ? "https" : "http";
+        return $"{safeScheme}://localhost:{port}";
     }
-    catch (Exception ex)
+
+    static string[] GetLanIpv4Addresses()
     {
-        if (logger.IsEnabled(LogLevel.Warning))
+        var list = new List<string>();
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
-            logger.LogWarning(ex, "Bitmap print failed: printer={PrinterName} doc={DocumentName}", body.PrinterName, documentName);
+            if (nic.OperationalStatus != OperationalStatus.Up)
+            {
+                continue;
+            }
+
+            if (nic.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
+            {
+                continue;
+            }
+
+            IPInterfaceProperties props;
+            try
+            {
+                props = nic.GetIPProperties();
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var uni in props.UnicastAddresses)
+            {
+                if (uni.Address.AddressFamily != AddressFamily.InterNetwork)
+                {
+                    continue;
+                }
+
+                var ip = uni.Address;
+                if (IPAddress.IsLoopback(ip))
+                {
+                    continue;
+                }
+
+                var bytes = ip.GetAddressBytes();
+                if (bytes.Length == 4 && bytes[0] == 169 && bytes[1] == 254)
+                {
+                    continue;
+                }
+
+                list.Add(ip.ToString());
+            }
         }
-        ok = false;
+
+        return list
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
-
-    var remoteIp = request.HttpContext.Connection.RemoteIpAddress?.ToString();
-    var entry = new PrintLogEntry(
-        Id: Guid.NewGuid(),
-        Timestamp: DateTimeOffset.UtcNow,
-        Kind: "image",
-        PrinterName: body.PrinterName,
-        DocumentName: documentName,
-        BytesLength: pngBytes.Length,
-        Status: ok ? "queued" : "failed",
-        Error: ok ? null : "print_failed",
-        RemoteIp: remoteIp);
-
-    await logStore.AppendAsync(entry);
-    if (ok)
-    {
-        if (logger.IsEnabled(LogLevel.Information))
-        {
-            logger.LogInformation("Queued image print: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
-        }
-    }
-    else
-    {
-        if (logger.IsEnabled(LogLevel.Warning))
-        {
-            logger.LogWarning("Image print failed: printer={PrinterName} doc={DocumentName} bytes={BytesLength} remoteIp={RemoteIp}", entry.PrinterName, entry.DocumentName, entry.BytesLength, entry.RemoteIp);
-        }
-    }
-
-    return ok
-        ? Results.Ok(new { status = "queued" })
-        : Results.Problem(title: "print_failed", statusCode: StatusCodes.Status500InternalServerError);
-});
-
-app.Run();
+}
 
 static class AppMetadata
 {
@@ -456,6 +1011,8 @@ static class AppMetadata
         "/api/printers/status",
         "/api/jobs/active",
         "/api/logs",
+        "/api/config",
+        "/api/restart",
         "/api/print/raw",
         "/api/print/tspl",
         "/api/print/image"
@@ -733,6 +1290,7 @@ static class UiPages
             <button data-tab="jobs">Fila</button>
             <button data-tab="printers">Impressoras</button>
             <button data-tab="tspl">TSPL</button>
+            <button data-tab="config">Config</button>
             <span class="muted" id="lastRefresh"></span>
           </div>
 
@@ -747,7 +1305,8 @@ static class UiPages
               tsplPrinter: localStorage.getItem("printserver_tspl_printer") || "",
               tsplDocName: localStorage.getItem("printserver_tspl_doc") || "tspl",
               tsplEncoding: localStorage.getItem("printserver_tspl_encoding") || "ascii",
-              tsplMounted: false
+              tsplMounted: false,
+              configMounted: false
             };
 
             const elApiKey = document.getElementById("apiKey");
@@ -756,6 +1315,14 @@ static class UiPages
             const elContent = document.getElementById("content");
 
             elApiKey.value = state.apiKey;
+
+            {
+              const qs = new URLSearchParams(location.search || "");
+              const hash = (location.hash || "").replace("#", "").trim().toLowerCase();
+              const tab = (qs.get("tab") || hash || "").trim().toLowerCase();
+              const allowed = ["logs", "jobs", "printers", "tspl", "config"];
+              if (allowed.includes(tab)) state.tab = tab;
+            }
 
             const defaultTsplSample = [
               'SIZE 100 mm,150 mm',
@@ -990,6 +1557,111 @@ static class UiPages
                   <td>${p.detectedErrorState ?? ""}</td>
                 </tr>`).join("")}</tbody>`;
               elContent.innerHTML = renderTable("Impressoras (Win32_Printer)", head + body);
+            }
+
+            async function refreshConfig() {
+              if (!state.configMounted) {
+                elContent.innerHTML = `
+                  <section class="card" style="grid-column: 1 / -1;">
+                    <h2 style="font-size: 14px; margin: 0 0 10px 0;">Configuração do servidor</h2>
+
+                    <div class="row" style="margin-top: 6px;">
+                      <label style="min-width: 120px;">Escutar em</label>
+                      <label style="display:flex; gap:8px; align-items:center;">
+                        <input id="cfg_listenAll" type="checkbox" />
+                        Todas interfaces (0.0.0.0)
+                      </label>
+                    </div>
+
+                    <div class="row" style="margin-top: 6px;">
+                      <label style="min-width: 120px;">Host/IP</label>
+                      <input id="cfg_host" placeholder="Ex: localhost ou 192.168.0.10" />
+                    </div>
+
+                    <div class="row" style="margin-top: 6px;">
+                      <label style="min-width: 120px;">Porta</label>
+                      <input id="cfg_port" type="number" min="1" max="65535" />
+                    </div>
+
+                    <div class="row" style="margin-top: 10px;">
+                      <button id="cfg_load">Carregar</button>
+                      <button id="cfg_save">Salvar</button>
+                      <button id="cfg_restart">Salvar e reiniciar</button>
+                      <span id="cfg_status" class="muted"></span>
+                    </div>
+
+                    <div style="margin-top: 10px;">
+                      <div class="muted" style="margin-bottom: 6px;">URLs efetivas</div>
+                      <pre id="cfg_urls" style="margin:0;"></pre>
+                    </div>
+                    <div style="margin-top: 10px;">
+                      <div class="muted" style="margin-bottom: 6px;">URL local</div>
+                      <pre id="cfg_local" style="margin:0;"></pre>
+                    </div>
+                    <div style="margin-top: 10px;">
+                      <div class="muted" style="margin-bottom: 6px;">URLs na rede (DHCP)</div>
+                      <pre id="cfg_lan" style="margin:0;"></pre>
+                    </div>
+                  </section>
+                `;
+
+                const elAll = document.getElementById("cfg_listenAll");
+                const elHost = document.getElementById("cfg_host");
+                const elPort = document.getElementById("cfg_port");
+                const elStatus = document.getElementById("cfg_status");
+                const elUrls = document.getElementById("cfg_urls");
+                const elLocal = document.getElementById("cfg_local");
+                const elLan = document.getElementById("cfg_lan");
+
+                function setBusy(text) { elStatus.textContent = text || ""; }
+
+                async function load() {
+                  setBusy("Carregando...");
+                  try {
+                    const data = await getJson("/api/config");
+                    elAll.checked = !!(data.config && data.config.listenAll);
+                    elHost.value = (data.config && data.config.host) ? data.config.host : "localhost";
+                    elPort.value = (data.config && data.config.port) ? String(data.config.port) : "5000";
+                    elUrls.textContent = (data.effectiveUrls || []).join("\n");
+                    elLocal.textContent = data.localUrl || "";
+                    elLan.textContent = (data.lanUrls || []).join("\n");
+                    elHost.disabled = elAll.checked;
+                    setBusy("");
+                  } catch (e) {
+                    if (String(e).includes("unauthorized")) return;
+                    setBusy(String(e));
+                  }
+                }
+
+                async function save(restart) {
+                  setBusy("Salvando...");
+                  try {
+                    const listenAll = !!elAll.checked;
+                    const host = (elHost.value || "").trim();
+                    const port = parseInt(String(elPort.value || ""), 10);
+                    await postJson("/api/config", { listenAll, host, port });
+                    setBusy(restart ? "Reiniciando..." : "Salvo. Reinicie para aplicar.");
+                    if (restart) {
+                      await postJson("/api/restart", {});
+                    }
+                  } catch (e) {
+                    if (String(e).includes("unauthorized")) return;
+                    setBusy(String(e));
+                  }
+                }
+
+                elAll.addEventListener("change", () => {
+                  elHost.disabled = elAll.checked;
+                });
+
+                document.getElementById("cfg_load").addEventListener("click", load);
+                document.getElementById("cfg_save").addEventListener("click", () => save(false));
+                document.getElementById("cfg_restart").addEventListener("click", () => save(true));
+
+                state.configMounted = true;
+                await load();
+                return;
+              }
             }
 
             function splitArgs(text) {
@@ -1489,6 +2161,7 @@ static class UiPages
                 if (state.tab === "jobs") return await refreshJobs();
                 if (state.tab === "printers") return await refreshPrinters();
                 if (state.tab === "tspl") return await refreshTspl();
+                if (state.tab === "config") return await refreshConfig();
               } catch (e) {
                 if (String(e).includes("unauthorized")) return;
                 elContent.innerHTML = `<pre>${String(e)}</pre>`;
