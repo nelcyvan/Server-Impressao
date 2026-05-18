@@ -19,7 +19,16 @@ sealed class Program
     [STAThread]
     public static async Task Main(string[] args)
     {
-        var builder = WebApplication.CreateBuilder(args);
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = AppContext.BaseDirectory
+        });
+
+        builder.Host.UseWindowsService(options =>
+        {
+            options.ServiceName = "PrintServer";
+        });
 
         var hasUrlsArg = args.Any(a => string.Equals(a, "--urls", StringComparison.OrdinalIgnoreCase));
         if (!hasUrlsArg)
